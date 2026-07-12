@@ -1,5 +1,6 @@
 -- Discord Username: rezoneperson | Roblox Username: Solifyre
 -- Connected Discord-GitHub
+-- Game link - https://www.roblox.com/games/84145306858209/Seoul-HD-Luau-Scripter-Application-Grappling-Hook
 --[[
 	PROJECT TITLE: Seoul HD Luau Scripter Application
 	DESCRIPTION: So I programmed a grappling hook

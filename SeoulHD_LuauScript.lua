@@ -7,7 +7,7 @@
 ]]
 
 -- ============================================================================
--- DEPENDENCIES & SETUP
+-- THE FOUR LOCALS ARE THE DEPENDENCIES AND SETUP
 -- ============================================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")

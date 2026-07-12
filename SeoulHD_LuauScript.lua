@@ -7,9 +7,6 @@
 	PURPOSE: Player hover their mouse on a wall and press Q to use their grappling hook
 ]]
 
--- ============================================================================
--- THE FOUR LOCALS ARE THE DEPENDENCIES AND SETUP
--- ============================================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -22,14 +19,14 @@ if not GrappleRemote then
 	return
 end
 
---==[ CONSTANTS ]==--
+--[ CONSTANTS ]--
 -- keeping these up top so they're easy to find and tweak while playtesting
 local MAX_HOOK_DISTANCE = 300 -- studs, ray just stops here if nothing was hit
 local ROPE_THICKNESS = 0.15
 local PULL_SPEED = 120 -- studs/sec while reeling someone in
 local ARRIVAL_DISTANCE = 5 -- close enough to the anchor, let go automatically
 
---==[ HELPER FUNCTIONS ]==--
+--[ HELPER FUNCTIONS ]--
 
 -- Just saves me from typing part.Property = value a dozen times for every
 -- part the hook spawns. Pass in a table of properties and it builds the part.
@@ -76,11 +73,7 @@ local function safeDestroy(instance)
 	end
 end
 
--- ============================================================================
--- MODULE/CLASS DEFINITIONS (if using metatables)
--- ============================================================================
-
---==[ HOOK CLASS ]==--
+--[ HOOK CLASS ]--
 -- every player gets their own Hook so the state, ropes and physics don't
 -- bleed into each other when more than one person is grappling at once
 
@@ -360,11 +353,7 @@ function Hook:Destroy()
 	self.hrp = nil
 end
 
--- ============================================================================
--- MAIN FUNCTIONALITY
--- ============================================================================
-
---==[ PLAYER HOOK MANAGEMENT ]==--
+--[ PLAYER HOOK MANAGEMENT ]--
 
 -- one Hook per player, keyed by the Player object so lookups on RemoteEvent
 -- calls are instant
@@ -390,7 +379,7 @@ local function onPlayerRemoving(player)
 	end
 end
 
---==[ REMOTE EVENT HANDLER ]==--
+--[ REMOTE EVENT HANDLER ]--
 
 -- client sends two things here: action ("Fire" or "Release") and direction
 -- (only matters for Fire). all the raycasting and physics happen server side,
@@ -411,10 +400,6 @@ GrappleRemote.OnServerEvent:Connect(function(player, action, direction)
 		hook:Release()
 	end
 end)
-
--- ============================================================================
--- INITIALIZATION
--- ============================================================================
 
 -- hook up PlayerAdded/CharacterAdded so every new player gets a Hook when
 -- they spawn. also covers the case where the character already exists,

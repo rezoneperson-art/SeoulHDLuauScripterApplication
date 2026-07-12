@@ -3,7 +3,7 @@
 --[[
 	PROJECT TITLE: Seoul HD Luau Scripter Application
 	DESCRIPTION: So I programmed a grappling hook
-	PURPOSE: Player hover their mouse on a wall and press Q to grappling hook directly to that position
+	PURPOSE: Player hover their mouse on a wall and press Q to use their grappling hook
 ]]
 
 -- ============================================================================
@@ -14,7 +14,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
--- The RemoteEvent that the client uses to tell the server "I want to fire/release the grapple." 
+-- Client fires this when they want to shoot or let go of the hook
 local GrappleRemote = ReplicatedStorage:FindFirstChild("GrappleEvent")
 if not GrappleRemote then
 	warn("GrappleHookSystem: Could not find 'GrappleEvent' RemoteEvent in ReplicatedStorage. The grapple hook will not function until it is created.")
@@ -22,18 +22,16 @@ if not GrappleRemote then
 end
 
 --==[ CONSTANTS ]==--
--- Tuning values for the grapple hook. Grouped here so they're easy to tweak
-local MAX_HOOK_DISTANCE = 300 -- Max raycast range in studs; beyond this the hook misses
-local ROPE_THICKNESS = 0.15   -- How thick the visual rope part appears
-local PULL_SPEED = 120        -- Target velocity when reeling the player in (studs/s)
-local ARRIVAL_DISTANCE = 5    -- Once the player is this close to the anchor, auto-release
+-- keeping these up top so they're easy to find and tweak while playtesting
+local MAX_HOOK_DISTANCE = 300 -- studs, ray just stops here if nothing was hit
+local ROPE_THICKNESS = 0.15
+local PULL_SPEED = 120 -- studs/sec while reeling someone in
+local ARRIVAL_DISTANCE = 5 -- close enough to the anchor, let go automatically
 
 --==[ HELPER FUNCTIONS ]==--
 
--- Small utility that wraps Instance.new("Part") and lets us set properties via a
--- table argument instead of writing them one by one. Every physical part the
--- grapple system creates (anchor, rope visual) goes through here, so we get
--- consistent surface defaults and less boilerplate.
+-- Just saves me from typing part.Property = value a dozen times for every
+-- part the hook spawns. Pass in a table of properties and it builds the part.
 local function createPart(properties)
 	local part = Instance.new("Part")
 	part.TopSurface = Enum.SurfaceType.Smooth
@@ -44,10 +42,9 @@ local function createPart(properties)
 	return part
 end
 
--- Creates an Attachment on the given part. An optional offset can be supplied
--- to position it away from the part's origin. We use attachments because
--- constraints (and our manual rope positioning) need a point in space to
--- anchor themselves to.
+-- makes an Attachment on a part, optionally offset from origin. Used on both
+-- ends of the rope so I have a consistent point to work from if I ever swap
+-- this over to a real constraint later
 local function createAttachment(parentPart, offset)
 	local attachment = Instance.new("Attachment")
 	attachment.Parent = parentPart
@@ -57,10 +54,9 @@ local function createAttachment(parentPart, offset)
 	return attachment
 end
 
--- Walks a table of RBXScriptConnections, disconnecting each one, then clears
--- the table. Called during teardown to make sure no lingering event handlers
--- stay alive after a Hook is destroyed — otherwise we'd leak connections every
--- time a player respawned or left.
+-- loops through a table of connections and disconnects them all, then wipes
+-- the table. mainly here so I don't forget to clean something up when a
+-- player respawns or leaves and end up with dead connections piling up
 local function cleanupTable(tbl)
 	for key, conn in pairs(tbl) do
 		if typeof(conn) == "RBXScriptConnection" then
@@ -70,10 +66,9 @@ local function cleanupTable(tbl)
 	end
 end
 
--- Wrapper around :Destroy() that checks whether the instance still has a
--- Parent first. During cleanup it's possible that something was already
--- removed (e.g., the character's parts got cleaned up by the engine), so
--- guarding each call prevents "attempt to index nil" errors.
+-- :Destroy() but it checks the instance still has a Parent first. Saves me
+-- from "attempt to index nil" errors when something's already been removed
+-- by the engine before my cleanup code gets to it
 local function safeDestroy(instance)
 	if instance and instance.Parent then
 		instance:Destroy()
@@ -85,51 +80,43 @@ end
 -- ============================================================================
 
 --==[ HOOK CLASS ]==--
--- Each player gets their own Hook instance that manages the full lifecycle of
--- a grapple: firing, attaching, swinging/pulling, releasing, and cleanup.
--- Using a metatable-based class keeps per-player state isolated and makes it
--- easy to support multiple players grappling at the same time without their
--- ropes or physics interfering with each other.
+-- every player gets their own Hook so the state, ropes and physics don't
+-- bleed into each other when more than one person is grappling at once
 
 local Hook = {}
 Hook.__index = Hook
 
--- Constructor. We pass in the player and their character so the Hook can hold
--- direct references to the Humanoid and HumanoidRootPart — these are used
--- throughout the swing/pull logic and checked frequently for validity since
--- they can disappear if the character dies or is removed mid-swing.
--- State machine starts at "Idle" meaning no grapple is active.
+-- takes the player and character so I can grab Humanoid/HumanoidRootPart up
+-- front, since I need both constantly throughout the swing logic. state
+-- starts at Idle, meaning nothing is currently hooked
 function Hook.new(player, character)
 	local self = setmetatable({}, Hook)
 
-	-- Core references
 	self.player = player
 	self.character = character
 	self.humanoid = character:FindFirstChildOfClass("Humanoid")
 	self.hrp = character:FindFirstChild("HumanoidRootPart")
 
-	-- Simple state machine with three states:
-	--   Idle    → no grapple active, ready to fire
-	--   Aiming  → raycast sent, waiting to see if it hit something
-	--   Swinging → rope attached, player is being pulled toward anchor
+	-- three states basically:
+	--   Idle     nothing happening, ready to fire
+	--   Aiming   raycast went out, waiting to know if it hit anything
+	--   Swinging hooked in, currently being pulled toward the anchor
 	self.state = "Idle"
 
-	-- References to the physical objects we create during :Attach(). We store
-	-- them as fields so :Release() and :Destroy() can clean everything up.
-	self.anchorPart = nil       -- Invisible anchored part placed at the raycast hit point
-	self.ropeConstraint = nil   -- Kept nil; we drive movement manually (see :Attach for why)
-	self.ropeVisual = nil       -- Thin visible part stretched between anchor and HRP each frame
-	self.charAttachment = nil   -- Attachment on the character's HumanoidRootPart
-	self.anchorAttachment = nil -- Attachment on the anchor part
-	self.heartbeatConn = nil    -- Heartbeat connection driving the per-frame pull + rope visual
-	self.diedConn = nil         -- Humanoid.Died connection for auto-cleanup
+	-- stuff created in :Attach(), stored here so Release/Destroy can clean it up
+	self.anchorPart = nil       -- invisible part sitting at the raycast hit point
+	self.ropeConstraint = nil   -- not actually used, see the note in :Attach
+	self.ropeVisual = nil       -- the rope you actually see, resized every frame
+	self.charAttachment = nil
+	self.anchorAttachment = nil
+	self.heartbeatConn = nil    -- the loop that does the pulling + rope visuals
+	self.diedConn = nil
 
-	-- General-purpose table for any event connections we want cleaned up on destroy.
 	self.connections = {}
 
-	-- If the character dies while grappling we want to tear down immediately so
-	-- we don't leave orphaned parts in the Workspace or keep running Heartbeat
-	-- against a character that no longer exists.
+	-- if they die mid-swing I want everything torn down right away instead of
+	-- leaving parts sitting in the workspace or a heartbeat loop running on a
+	-- character that doesn't exist anymore
 	if self.humanoid then
 		self.diedConn = self.humanoid.Died:Connect(function()
 			self:Destroy()
@@ -140,69 +127,58 @@ function Hook.new(player, character)
 end
 
 -- Hook:Fire(direction)
--- Entry point for firing the grapple. The client sends a world-space direction
--- vector (derived from their camera look direction) and we do the raycast on
--- the server so it can't be spoofed. If the ray connects, we hand off to
--- :Attach() which sets up the rope and starts the pull loop. If it misses we
--- quietly reset to Idle so the player can try again.
+-- called when the player presses Q. direction comes from the client's camera
+-- look vector, but the raycast itself happens here on the server so it can't
+-- be spoofed. connects to :Attach() if it hits something, otherwise just
+-- resets back to Idle so they can try again
 function Hook:Fire(direction)
-	-- Only allow firing from Idle — prevents double-firing or re-firing mid-swing.
+	-- only fire from Idle, otherwise people could spam Q and re-fire mid swing
 	if self.state ~= "Idle" then
 		return
 	end
 
-	-- If the HumanoidRootPart is gone (character being torn down) there's nothing
-	-- to raycast from, so bail out.
+	-- nothing to raycast from if the character's being torn down
 	if not self.hrp or not self.hrp.Parent then
 		return
 	end
 
-	-- Mark Aiming so :Attach() knows we came from a valid Fire call.
 	self.state = "Aiming"
 
-	-- Set up raycast parameters. We exclude the character's own parts from the
-	-- ray — otherwise the ray would immediately hit the player's torso/limbs and
-	-- never reach the environment behind them.
+	-- exclude the character itself so the ray doesn't just hit their own
+	-- torso a foot in front of the camera
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 	rayParams.FilterDescendantsInstances = {self.character}
 	rayParams.IgnoreWater = true
 
-	-- Normalize so the direction is a unit vector — this lets us multiply by
-	-- MAX HOOK DISTANCE to get the exact ray length we want.
 	local normalizedDirection = direction.Unit
 
-	-- Cast from the HRP outward. The result (if any) contains the .Position where
-	-- the ray hit and the .Instance it hit — both are needed by :Attach().
 	local rayResult = Workspace:Raycast(self.hrp.Position, normalizedDirection * MAX_HOOK_DISTANCE, rayParams)
 
 	if rayResult and rayResult.Instance then
 		self:Attach(rayResult.Position, rayResult.Instance)
 	else
-		-- Missed — nothing to hook onto. Reset so the player can fire again.
+		-- missed, nothing to hook onto
 		self.state = "Idle"
 	end
 end
 
 -- Hook:Attach(hitPosition, hitPart)
--- Called after a successful raycast. Sets up the physical grapple: an invisible
--- anchor part at the hit point, a visible rope stretched between the anchor and
--- the player, and a Heartbeat loop that drags the player toward the anchor.
+-- runs after a successful raycast. builds the anchor, the visible rope, and
+-- starts the heartbeat loop that actually drags the player in.
 --
--- We intentionally do NOT use a RopeConstraint here. In earlier iterations the
--- constraint solver ran after our manual velocity changes each frame and applied
--- corrective forces that cancelled out the pull — the player would jitter in
--- place instead of being reeled in. By skipping the constraint entirely and
--- driving movement through AssemblyLinearVelocity we get full, predictable
--- control over how the player moves toward the anchor.
+-- note: I'm not using a RopeConstraint for this. tried it early on and the
+-- physics solver kept fighting my velocity changes every frame, so instead
+-- of reeling in smoothly the player would just jitter in place. setting
+-- AssemblyLinearVelocity directly every frame skips that problem entirely
 function Hook:Attach(hitPosition, hitPart)
-	-- Guard: must have come from :Fire() (state == "Aiming").
+	-- should only ever get here from :Fire()
 	if self.state ~= "Aiming" then
 		return
 	end
 
-	-- Double-check the HRP is still valid — the character could have died between
-	-- the raycast and this call in edge cases.
+	-- character could've died in the gap between the raycast firing and this
+	-- running, so double check
 	if not self.hrp or not self.hrp.Parent then
 		self.state = "Idle"
 		return
@@ -210,15 +186,11 @@ function Hook:Attach(hitPosition, hitPart)
 
 	self.state = "Swinging"
 
-	-- Measure how far the player is from the hit point. This is used as the
-	-- initial length of the visual rope and gives us a baseline for the pull.
 	local charPos = self.hrp.Position
 	local ropeLength = (hitPosition - charPos).Magnitude
 
-	-- Spawn an invisible anchored part at the exact raycast hit position. This
-	-- acts as the fixed anchor that the rope visually connects to. It's tiny,
-	-- non-collidable, and has CanQuery disabled so it doesn't interfere with
-	-- other raycasts or physics in the world.
+	-- tiny invisible part at the hit point, this is what the rope stretches
+	-- toward. CanQuery is off so it doesn't mess with other raycasts
 	self.anchorPart = createPart({
 		Name = "GrappleAnchor_" .. self.player.Name,
 		Size = Vector3.new(0.5, 0.5, 0.5),
@@ -230,19 +202,15 @@ function Hook:Attach(hitPosition, hitPart)
 	})
 	self.anchorPart.CFrame = CFrame.new(hitPosition)
 
-	-- Attachments on both ends. Even though we're not using a constraint, we
-	-- keep these around in case we want to swap in a constraint-based approach
-	-- later, and they don't cost anything meaningful.
+	-- attachments on both ends, not doing anything with them right now but
+	-- they're cheap and might be useful if I switch to a constraint later
 	self.anchorAttachment = createAttachment(self.anchorPart, Vector3.zero)
 	self.charAttachment = createAttachment(self.hrp, Vector3.zero)
 
-	-- Explicitly nil — see the comment at the top of this function for why we
-	-- skip the RopeConstraint and do manual velocity control instead.
 	self.ropeConstraint = nil
 
-	-- Create the visible rope. This is just a thin part that we re-position and
-	-- re-size every Heartbeat frame to stretch between the anchor and the player.
-	-- Using Neon material gives it a clean, readable look against most environments.
+	-- the actual visible rope, just a thin part I reposition and resize
+	-- every heartbeat so it looks like it's stretching between anchor and player
 	self.ropeVisual = createPart({
 		Name = "GrappleRope_" .. self.player.Name,
 		Size = Vector3.new(ROPE_THICKNESS, ROPE_THICKNESS, ropeLength),
@@ -254,28 +222,22 @@ function Hook:Attach(hitPosition, hitPart)
 		Parent = Workspace,
 	})
 
-	-- Put the Humanoid into PlatformStand so it stops applying its own movement
-	-- forces. While PlatformStand is active the Humanoid essentially lets go of
-	-- the character's physics, which means our AssemblyLinearVelocity changes
-	-- aren't being fought by the default walk/fall controller. We restore it
-	-- back to false in :Release().
+	-- PlatformStand basically tells the humanoid to stop fighting me for
+	-- control of the character's physics. without it the default walk/fall
+	-- controller cancels out my velocity changes. turned back off in :Release()
 	if self.humanoid then
 		self.humanoid.PlatformStand = true
 	end
 
-	-- This is the core of the grapple. Every Heartbeat frame (roughly 60x/sec)
-	-- we do three things while the player is in the Swinging state:
-	--   1. Update the visual rope so it stays stretched between the anchor and HRP.
-	--   2. Set the character's velocity directly toward the anchor at PULL_SPEED.
-	--      We do NOT lerp here — a gradual ramp lets gravity win the first few
-	--      frames (since PlatformStand removed the Humanoid's fall resistance),
-	--      causing the player to drop before the pull takes over. Setting the
-	--      velocity outright each frame completely overrides gravity and sends
-	--      the player flying straight toward the hook point immediately.
-	--   3. Check if the player has gotten close enough to auto-release the hook.
+	-- the actual grapple loop, runs every heartbeat while Swinging:
+	--   1. update the rope so it stays stretched between anchor and player
+	--   2. set velocity straight toward the anchor at PULL_SPEED (not lerped,
+	--      because with PlatformStand on there's nothing resisting gravity
+	--      anymore, so a gradual ramp would just let the player fall for a
+	--      few frames before the pull caught up)
+	--   3. check distance to anchor and auto release once close enough
 	self.heartbeatConn = RunService.Heartbeat:Connect(function(dt)
-		-- Bail out if the state changed (e.g., Release was called) or the HRP
-		-- vanished mid-frame. This prevents errors if cleanup happened between frames.
+		-- state could've changed or the hrp could be gone by the time this runs
 		if self.state ~= "Swinging" or not self.hrp or not self.hrp.Parent then
 			return
 		end
@@ -285,10 +247,8 @@ function Hook:Attach(hitPosition, hitPart)
 		local ropeVec = charPos2 - anchorPos
 		local currentDist = ropeVec.Magnitude
 
-		-- Once the player is close enough to the anchor, release the hook.
-		-- We give a small residual nudge in the pull direction (30% of PULL_SPEED)
-		-- so the player keeps moving toward the surface instead of stopping dead
-		-- the instant they hit the release threshold.
+		-- close enough, let go. gives a small nudge in the pull direction so
+		-- they don't just stop dead the instant they cross the threshold
 		if currentDist <= ARRIVAL_DISTANCE then
 			if currentDist > 0.01 then
 				local residualDir = (-ropeVec).Unit
@@ -298,69 +258,57 @@ function Hook:Attach(hitPosition, hitPart)
 			return
 		end
 
-		-- Reposition the visual rope. We place it at the midpoint between the
-		-- anchor and the player, point its front face toward the player using
-		-- CFrame.lookAt, and set its Z size to the current distance so it
-		-- appears to stretch and contract as the player moves.
+		-- rope sits at the midpoint between anchor and player, pointed at the
+		-- player, and stretched/shrunk to match the current distance
 		if currentDist > 0.01 then
 			local midpoint = (anchorPos + charPos2) / 2
 			self.ropeVisual.Size = Vector3.new(ROPE_THICKNESS, ROPE_THICKNESS, currentDist)
 			self.ropeVisual.CFrame = CFrame.lookAt(midpoint, charPos2)
 		end
 
-		-- Pull the player toward the anchor. We set the velocity directly rather
-		-- than lerping — when PlatformStand is on the Humanoid no longer resists
-		-- gravity, so the character would drop before a gradual lerp could ramp
-		-- up enough to counter it. Setting velocity outright each frame means
-		-- gravity never gets a chance to pull the player down; the full PULL_SPEED
-		-- is applied immediately toward the anchor point, including straight up.
+		-- pull toward the anchor. setting velocity directly instead of lerping
+		-- so gravity never gets a window to win, full speed applies immediately
 		if currentDist > 0.01 then
 			local pullDir = (-ropeVec).Unit
 			self.hrp.AssemblyLinearVelocity = pullDir * PULL_SPEED
 		end
 	end)
 
-	-- Track the Heartbeat connection so :Destroy() can disconnect it later.
 	self.connections["heartbeat"] = self.heartbeatConn
 end
 
 -- Hook:Release()
--- Detaches the grapple and tears down all the physical objects we created in
--- :Attach(). Called when the player releases the key, when they arrive at the
--- anchor, or as part of :Destroy(). After this, the player regains normal
--- movement control and the state returns to Idle so they can fire again.
+-- lets go of the grapple and cleans up everything :Attach() made. happens
+-- when the player releases the key, they reach the anchor, or as part of a
+-- full :Destroy(). player gets normal movement back and can fire again after
 function Hook:Release()
-	-- Only release if we're actively swinging or mid-aim. This prevents
-	-- double-release or releasing from Idle.
+	-- only makes sense from Swinging or Aiming, stops double releases
 	if self.state ~= "Swinging" and self.state ~= "Aiming" then
 		return
 	end
 
 	self.state = "Idle"
 
-	-- Turn PlatformStand back off so the Humanoid's normal movement controller
-	-- takes over again. Without this the player would be stuck unable to walk.
+	-- hand movement back to the humanoid's normal controller, otherwise
+	-- they'd be stuck unable to walk
 	if self.humanoid and self.humanoid.Parent then
 		self.humanoid.PlatformStand = false
 	end
 
-	-- Tear down every physical object. safeDestroy checks for nil/missing parent
-	-- so this won't error even if something was already cleaned up externally.
+	-- safeDestroy handles anything that's already gone, so this won't error
+	-- even if something got cleaned up elsewhere first
 	safeDestroy(self.ropeVisual)
 	safeDestroy(self.ropeConstraint)
 	safeDestroy(self.charAttachment)
 	safeDestroy(self.anchorAttachment)
 	safeDestroy(self.anchorPart)
 
-	-- Nil out the references so we don't accidentally operate on dead instances
-	-- and so the garbage collector can reclaim them.
 	self.ropeVisual = nil
 	self.ropeConstraint = nil
 	self.charAttachment = nil
 	self.anchorAttachment = nil
 	self.anchorPart = nil
 
-	-- Stop the per-frame update loop.
 	if self.heartbeatConn then
 		self.heartbeatConn:Disconnect()
 		self.heartbeatConn = nil
@@ -369,15 +317,11 @@ function Hook:Release()
 end
 
 -- Hook:Destroy()
--- Full teardown. This is the final cleanup that happens when a character dies
--- or a player leaves the game. It inlines the release logic (rather than calling
--- :Release()) because we want to force cleanup regardless of the current state
--- and avoid the state guard in :Release(). After this runs the Hook instance
--- is dead and should not be used again.
+-- the real teardown, runs when a character dies or a player leaves. this
+-- doesn't just call :Release() because Release has a state guard that could
+-- skip cleanup if state ends up somewhere unexpected, this version forces it
+-- regardless. once this runs the Hook shouldn't be touched again
 function Hook:Destroy()
-	-- If a grapple is active, clean up all the physical objects inline.
-	-- We don't call :Release() here because its state guard could skip cleanup
-	-- if the state happened to be something unexpected.
 	if self.state == "Swinging" or self.state == "Aiming" then
 		self.state = "Idle"
 		if self.humanoid and self.humanoid.Parent then
@@ -399,19 +343,16 @@ function Hook:Destroy()
 		end
 	end
 
-	-- Disconnect anything still in the connections table.
 	cleanupTable(self.connections)
 
-	-- The Died listener is stored separately (not in self.connections) so we
-	-- disconnect it explicitly here.
+	-- diedConn lives outside self.connections so it needs its own disconnect
 	if self.diedConn then
 		self.diedConn:Disconnect()
 		self.diedConn = nil
 	end
 
-	-- Drop all references so the Hook can be garbage collected. If we left these
-	-- pointing at the old character/humanoid we'd have a lingering reference
-	-- keeping the old character model in memory.
+	-- drop references so the old character/humanoid can actually get garbage
+	-- collected instead of being held onto by this Hook forever
 	self.player = nil
 	self.character = nil
 	self.humanoid = nil
@@ -424,14 +365,13 @@ end
 
 --==[ PLAYER HOOK MANAGEMENT ]==--
 
--- One Hook per player. We use a dictionary keyed by the Player object so we
--- can look up the active hook in O(1) when a RemoteEvent comes in.
+-- one Hook per player, keyed by the Player object so lookups on RemoteEvent
+-- calls are instant
 local playerHooks = {}
 
--- Called whenever a player's character (re)spawns. We tear down the old Hook
--- if one still exists (safety against double-spawn edge cases) then create a
--- fresh one bound to the new character. This ensures the Hook always points at
--- valid, current Humanoid/HRP references.
+-- runs whenever a character (re)spawns. destroys the old hook first just in
+-- case one's still hanging around, then makes a fresh one pointing at the
+-- new character so it's never holding stale Humanoid/HRP references
 local function onCharacterAdded(player, character)
 	if playerHooks[player] then
 		playerHooks[player]:Destroy()
@@ -440,9 +380,8 @@ local function onCharacterAdded(player, character)
 	playerHooks[player] = Hook.new(player, character)
 end
 
--- Called when a player leaves. Destroys their Hook so we don't leak parts,
--- connections, or references. If we skipped this, the Hook and its Heartbeat
--- loop would keep running against a character that's no longer in the game.
+-- player left, destroy their hook so nothing keeps running against a
+-- character that's no longer in the game
 local function onPlayerRemoving(player)
 	if playerHooks[player] then
 		playerHooks[player]:Destroy()
@@ -452,15 +391,10 @@ end
 
 --==[ REMOTE EVENT HANDLER ]==--
 
--- This is where the client's intent reaches the server. The client fires the
--- RemoteEvent with two arguments:
---   action    — "Fire" or "Release"
---   direction — a Vector3 world-space aim direction (only meaningful for "Fire")
---
--- All the actual physics, raycasting, and state changes happen server-side.
--- The client only expresses intent; the server validates and executes. This
--- means an exploiter can't fake a grapple to an arbitrary position or bypass
--- the max range — the server does its own raycast and ignores anything invalid.
+-- client sends two things here: action ("Fire" or "Release") and direction
+-- (only matters for Fire). all the raycasting and physics happen server side,
+-- client is just expressing intent, so there's no way to spoof a hook to some
+-- arbitrary spot or skip the max range check
 GrappleRemote.OnServerEvent:Connect(function(player, action, direction)
 	local hook = playerHooks[player]
 	if not hook then
@@ -468,8 +402,7 @@ GrappleRemote.OnServerEvent:Connect(function(player, action, direction)
 	end
 
 	if action == "Fire" then
-		-- Make sure the direction is actually a Vector3 before using it.
-		-- If a client sends garbage data we just ignore it rather than erroring.
+		-- ignore garbage data instead of erroring if it's not actually a Vector3
 		if typeof(direction) == "Vector3" then
 			hook:Fire(direction)
 		end
@@ -482,29 +415,23 @@ end)
 -- INITIALIZATION
 -- ============================================================================
 
--- Wire up the PlayerAdded/CharacterAdded events. When a new player joins we
--- listen for their character spawning and create a Hook. We also handle the
--- case where the character already exists (common in Studio play solo where
--- the character loads before the script runs).
+-- hook up PlayerAdded/CharacterAdded so every new player gets a Hook when
+-- they spawn. also covers the case where the character already exists,
+-- which happens a lot in studio when playtesting solo
 Players.PlayerAdded:Connect(function(player)
 	player.CharacterAdded:Connect(function(character)
 		onCharacterAdded(player, character)
 	end)
 
-	-- If the character is already spawned (Studio hot-reload scenario), set up
-	-- the Hook immediately rather than waiting for the next CharacterAdded.
 	if player.Character then
 		onCharacterAdded(player, player.Character)
 	end
 end)
 
--- Clean up when a player leaves the game.
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
--- Handle players that were already connected before this script ran. This can
--- happen when hot-reloading scripts in Studio during a play session — the
--- existing players won't trigger PlayerAdded again, so we need to set up their
--- hooks manually.
+-- covers players who were already in the game before this script ran, which
+-- happens with hot reloading in studio since they won't fire PlayerAdded again
 for _, player in ipairs(Players:GetPlayers()) do
 	player.CharacterAdded:Connect(function(character)
 		onCharacterAdded(player, character)
